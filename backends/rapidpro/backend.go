@@ -3,6 +3,7 @@ package rapidpro
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -19,10 +20,13 @@ import (
 	"github.com/garyburd/redigo/redis"
 	"github.com/jmoiron/sqlx"
 	"github.com/nyaruka/courier"
+	"github.com/nyaruka/courier/batch"
 	"github.com/nyaruka/courier/chatbase"
 	"github.com/nyaruka/courier/queue"
 	"github.com/nyaruka/courier/utils"
 	"github.com/nyaruka/gocommon/urns"
+	"github.com/nyaruka/librato"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
@@ -35,10 +39,13 @@ const sentSetName = "msgs_sent_%s"
 // constants used in org configs for chatbase
 const chatbaseAPIKey = "CHATBASE_API_KEY"
 const chatbaseVersion = "CHATBASE_VERSION"
-const chatbaseMessageType = "msg"
+const chatbaseMessageType = "agent"
 
 // our timeout for backend operations
 const backendTimeout = time.Second * 20
+
+// number of messages for loop detection
+const msgLoopThreshold = 20
 
 func init() {
 	courier.RegisterBackend("rapidpro", newBackend)
@@ -161,7 +168,7 @@ func (b *backend) PopNextOutgoingMsg(ctx context.Context) (courier.Msg, error) {
 }
 
 var luaSent = redis.NewScript(3,
-	`-- KEYS: [TodayKey, YesterdayKey, MsgId]
+	`-- KEYS: [TodayKey, YesterdayKey, MsgID]
      local found = redis.call("sismember", KEYS[1], KEYS[3])
      if found == 1 then
 	   return 1
@@ -178,6 +185,63 @@ func (b *backend) WasMsgSent(ctx context.Context, msg courier.Msg) (bool, error)
 	todayKey := fmt.Sprintf(sentSetName, time.Now().UTC().Format("2006_01_02"))
 	yesterdayKey := fmt.Sprintf(sentSetName, time.Now().Add(time.Hour*-24).UTC().Format("2006_01_02"))
 	return redis.Bool(luaSent.Do(rc, todayKey, yesterdayKey, msg.ID().String()))
+}
+
+var luaMsgLoop = redis.NewScript(3, `-- KEYS: [key, contact_id, text]
+	local key = KEYS[1]
+	local contact_id = KEYS[2]
+	local text = KEYS[3]
+	local count = 1
+
+    -- try to look up in window
+	local record = redis.call("hget", key, contact_id)
+	if record then
+		local record_count = tonumber(string.sub(record, 1, 2))
+		local record_text = string.sub(record, 4, -1)
+
+		if record_text == text then 
+			count = math.min(record_count + 1, 99)
+		else
+			count = 1
+		end		
+	end
+
+	-- create our new record with our updated count
+	record = string.format("%02d:%s", count, text)
+
+	-- write our new record with updated count
+	redis.call("hset", key, contact_id, record)
+
+	-- sets its expiration
+	redis.call("expire", key, 300)
+
+	return count
+`)
+
+// IsMsgLoop checks whether the passed in message is part of a loop
+func (b *backend) IsMsgLoop(ctx context.Context, msg courier.Msg) (bool, error) {
+	m := msg.(*DBMsg)
+
+	// things that aren't replies can't be loops, neither do we count retries
+	if m.ResponseToID_ == courier.NilMsgID || m.ErrorCount_ > 0 {
+		return false, nil
+	}
+
+	// otherwise run our script to check whether this is a loop in the past 5 minutes
+	rc := b.redisPool.Get()
+	defer rc.Close()
+
+	keyTime := time.Now().UTC().Round(time.Minute * 5)
+	key := fmt.Sprintf(sentSetName, fmt.Sprintf("loop_msgs:%s", keyTime.Format("2006-01-02-15:04")))
+	count, err := redis.Int(luaMsgLoop.Do(rc, key, m.ContactID_, m.Text_))
+	if err != nil {
+		return false, errors.Wrapf(err, "error while checking for msg loop")
+	}
+
+	if count >= msgLoopThreshold {
+		return true, nil
+	}
+	return false, nil
 }
 
 // MarkOutgoingMsgComplete marks the passed in message as having completed processing, freeing up a worker for that channel
@@ -242,9 +306,21 @@ func (b *backend) WriteMsgStatus(ctx context.Context, status courier.MsgStatus) 
 	timeout, cancel := context.WithTimeout(ctx, backendTimeout)
 	defer cancel()
 
-	err := writeMsgStatus(timeout, b, status)
-	if err != nil {
-		return err
+	if status.HasUpdatedURN() {
+		err := b.updateContactURN(ctx, status)
+		if err != nil {
+			return errors.Wrap(err, "error updating contact URN")
+		}
+	}
+	// if we have an ID, we can have our batch commit for us
+	if status.ID() != courier.NilMsgID {
+		b.statusCommitter.Queue(status.(*DBMsgStatus))
+	} else {
+		// otherwise, write normally (synchronously)
+		err := writeMsgStatus(timeout, b, status)
+		if err != nil {
+			return err
+		}
 	}
 
 	// if we have an id and are marking an outgoing msg as errored, then clear our sent flag
@@ -265,6 +341,64 @@ func (b *backend) WriteMsgStatus(ctx context.Context, status courier.MsgStatus) 
 	}
 
 	return nil
+}
+
+// updateContactURN updates contact URN according to the old/new URNs from status
+func (b *backend) updateContactURN(ctx context.Context, status courier.MsgStatus) error {
+	old, new := status.UpdatedURN()
+
+	// retrieve channel
+	channel, err := b.GetChannel(ctx, courier.AnyChannelType, status.ChannelUUID())
+	if err != nil {
+		return errors.Wrap(err, "error retrieving channel")
+	}
+	dbChannel := channel.(*DBChannel)
+	tx, err := b.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	// retrieve the old URN
+	oldContactURN, err := selectContactURN(tx, dbChannel.OrgID(), old)
+	if err != nil {
+		return errors.Wrap(err, "error retrieving old contact URN")
+	}
+	// retrieve the new URN
+	newContactURN, err := selectContactURN(tx, dbChannel.OrgID(), new)
+	if err != nil {
+		// only update the old URN path if the new URN doesn't exist
+		if err == sql.ErrNoRows {
+			oldContactURN.Path = new.Path()
+			oldContactURN.Identity = string(new.Identity())
+
+			err = fullyUpdateContactURN(tx, oldContactURN)
+			if err != nil {
+				tx.Rollback()
+				return errors.Wrap(err, "error updating old contact URN")
+			}
+			return tx.Commit()
+		}
+		return errors.Wrap(err, "error retrieving new contact URN")
+	}
+
+	// only update the new URN if it doesn't have an associated contact
+	if newContactURN.ContactID == NilContactID {
+		newContactURN.ContactID = oldContactURN.ContactID
+	}
+	// remove contact association from old URN
+	oldContactURN.ContactID = NilContactID
+
+	// update URNs
+	err = fullyUpdateContactURN(tx, newContactURN)
+	if err != nil {
+		tx.Rollback()
+		return errors.Wrap(err, "error updating new contact URN")
+	}
+	err = fullyUpdateContactURN(tx, oldContactURN)
+	if err != nil {
+		tx.Rollback()
+		return errors.Wrap(err, "error updating old contact URN")
+	}
+	return tx.Commit()
 }
 
 // NewChannelEvent creates a new channel event with the passed in parameters
@@ -294,6 +428,23 @@ func (b *backend) WriteChannelLogs(ctx context.Context, logs []*courier.ChannelL
 	return nil
 }
 
+// Check if external ID has been seen in a period
+func (b *backend) CheckExternalIDSeen(msg courier.Msg) courier.Msg {
+	var prevUUID = checkExternalIDSeen(b, msg)
+	m := msg.(*DBMsg)
+	if prevUUID != courier.NilMsgUUID {
+		// if so, use its UUID and that we've been written
+		m.UUID_ = prevUUID
+		m.alreadyWritten = true
+	}
+	return m
+}
+
+// Mark a external ID as seen for a period
+func (b *backend) WriteExternalIDSeen(msg courier.Msg) {
+	writeExternalIDSeen(b, msg)
+}
+
 // Health returns the health of this backend as a string, returning "" if all is well
 func (b *backend) Health() string {
 	// test redis
@@ -315,6 +466,47 @@ func (b *backend) Health() string {
 	}
 
 	return health.String()
+}
+
+// Heartbeat is called every minute, we log our queue depth to librato
+func (b *backend) Heartbeat() error {
+	rc := b.redisPool.Get()
+	defer rc.Close()
+
+	active, err := redis.Strings(rc.Do("zrange", fmt.Sprintf("%s:active", msgQueueName), "0", "-1"))
+	if err != nil {
+		return errors.Wrapf(err, "error getting active queues")
+	}
+	throttled, err := redis.Strings(rc.Do("zrange", fmt.Sprintf("%s:throttled", msgQueueName), "0", "-1"))
+	if err != nil {
+		return errors.Wrapf(err, "error getting throttled queues")
+	}
+	queues := append(active, throttled...)
+
+	prioritySize := 0
+	bulkSize := 0
+	for _, queue := range queues {
+		q := fmt.Sprintf("%s/1", queue)
+		count, err := redis.Int(rc.Do("zcard", q))
+		if err != nil {
+			return errors.Wrapf(err, "error getting size of priority queue: %s", q)
+		}
+		prioritySize += count
+
+		q = fmt.Sprintf("%s/0", queue)
+		count, err = redis.Int(rc.Do("zcard", q))
+		if err != nil {
+			return errors.Wrapf(err, "error getting size of bulk queue: %s", q)
+		}
+		bulkSize += count
+	}
+
+	// log our total
+	librato.Gauge("courier.bulk_queue", float64(bulkSize))
+	librato.Gauge("courier.priority_queue", float64(prioritySize))
+	logrus.WithField("bulk_queue", bulkSize).WithField("priority_queue", prioritySize).Info("heartbeat queue sizes calculated")
+
+	return nil
 }
 
 // Status returns information on our queue sizes, number of workers etc..
@@ -512,6 +704,24 @@ func (b *backend) Start() error {
 		log.Info("spool directories ok")
 	}
 
+	// create our status committer and start it
+	b.statusCommitter = batch.NewCommitter("status committer", b.db, bulkUpdateMsgStatusSQL, time.Millisecond*500, b.committerWG,
+		func(err error, value batch.Value) {
+			logrus.WithField("comp", "status committer").WithError(err).Error("error writing status")
+			err = courier.WriteToSpool(b.config.SpoolDir, "statuses", value)
+			if err != nil {
+				logrus.WithField("comp", "status committer").WithError(err).Error("error writing status to spool")
+			}
+		})
+	b.statusCommitter.Start()
+
+	// create our log committer and start it
+	b.logCommitter = batch.NewCommitter("log committer", b.db, insertLogSQL, time.Millisecond*500, b.committerWG,
+		func(err error, value batch.Value) {
+			logrus.WithField("comp", "log committer").WithError(err).Error("error writing channel log")
+		})
+	b.logCommitter.Start()
+
 	// register and start our spool flushers
 	courier.RegisterFlusher(path.Join(b.config.SpoolDir, "msgs"), b.flushMsgFile)
 	courier.RegisterFlusher(path.Join(b.config.SpoolDir, "statuses"), b.flushStatusFile)
@@ -536,6 +746,19 @@ func (b *backend) Stop() error {
 }
 
 func (b *backend) Cleanup() error {
+	// stop our status committer
+	if b.statusCommitter != nil {
+		b.statusCommitter.Stop()
+	}
+
+	// stop our log committer
+	if b.logCommitter != nil {
+		b.logCommitter.Stop()
+	}
+
+	// wait for them to flush fully
+	b.committerWG.Wait()
+
 	// close our db and redis pool
 	if b.db != nil {
 		b.db.Close()
@@ -555,11 +778,17 @@ func newBackend(config *courier.Config) courier.Backend {
 
 		stopChan:  make(chan bool),
 		waitGroup: &sync.WaitGroup{},
+
+		committerWG: &sync.WaitGroup{},
 	}
 }
 
 type backend struct {
 	config *courier.Config
+
+	statusCommitter batch.Committer
+	logCommitter    batch.Committer
+	committerWG     *sync.WaitGroup
 
 	db        *sqlx.DB
 	redisPool *redis.Pool

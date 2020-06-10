@@ -4,9 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"github.com/nyaruka/gocommon/urns"
 	"log"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -21,6 +24,8 @@ func newMsgStatus(channel courier.Channel, id courier.MsgID, externalID string, 
 		ChannelUUID_: channel.UUID(),
 		ChannelID_:   dbChannel.ID(),
 		ID_:          id,
+		OldURN_:      urns.NilURN,
+		NewURN_:      urns.NilURN,
 		ExternalID_:  externalID,
 		Status_:      status,
 		ModifiedOn_:  time.Now().In(time.UTC),
@@ -32,6 +37,7 @@ func writeMsgStatus(ctx context.Context, b *backend, status courier.MsgStatus) e
 	dbStatus := status.(*DBMsgStatus)
 
 	err := writeMsgStatusToDB(ctx, b, dbStatus)
+
 	if err == courier.ErrMsgNotFound {
 		return err
 	}
@@ -45,10 +51,10 @@ func writeMsgStatus(ctx context.Context, b *backend, status courier.MsgStatus) e
 }
 
 const selectMsgIDForID = `
-SELECT m."id" FROM "msgs_msg" m INNER JOIN "channels_channel" c ON (m."channel_id" = c."id") WHERE (m."id" = $1 AND c."uuid" = $2)`
+SELECT m."id" FROM "msgs_msg" m INNER JOIN "channels_channel" c ON (m."channel_id" = c."id") WHERE (m."id" = $1 AND c."uuid" = $2 AND m."direction" = 'O')`
 
 const selectMsgIDForExternalID = `
-SELECT m."id" FROM "msgs_msg" m INNER JOIN "channels_channel" c ON (m."channel_id" = c."id") WHERE (m."external_id" = $1 AND c."uuid" = $2)`
+SELECT m."id" FROM "msgs_msg" m INNER JOIN "channels_channel" c ON (m."channel_id" = c."id") WHERE (m."external_id" = $1 AND c."uuid" = $2 AND m."direction" = 'O')`
 
 func checkMsgExists(b *backend, status courier.MsgStatus) (err error) {
 	var id int64
@@ -119,7 +125,8 @@ UPDATE msgs_msg SET
 	modified_on = :modified_on
 WHERE 
 	msgs_msg.id = :msg_id AND
-	msgs_msg.channel_id = :channel_id
+	msgs_msg.channel_id = :channel_id AND 
+	msgs_msg.direction = 'O'
 RETURNING 
 	msgs_msg.id
 `
@@ -166,7 +173,7 @@ UPDATE msgs_msg SET
 		END,
 	modified_on = :modified_on
 WHERE 
-	msgs_msg.id = (SELECT msgs_msg.id FROM msgs_msg WHERE msgs_msg.external_id = :external_id AND msgs_msg.channel_id = :channel_id LIMIT 1)
+	msgs_msg.id = (SELECT msgs_msg.id FROM msgs_msg WHERE msgs_msg.external_id = :external_id AND msgs_msg.channel_id = :channel_id AND msgs_msg.direction = 'O' LIMIT 1)
 RETURNING 
 	msgs_msg.id
 `
@@ -223,6 +230,67 @@ func (b *backend) flushStatusFile(filename string, contents []byte) error {
 	return err
 }
 
+const bulkUpdateMsgStatusSQL = `
+UPDATE msgs_msg SET 
+	status = CASE 
+		WHEN 
+			s.status = 'E' 
+		THEN CASE 
+			WHEN 
+				error_count >= 2 OR msgs_msg.status = 'F' 
+			THEN 
+				'F' 
+			ELSE 
+				'E' 
+			END 
+		ELSE 
+			s.status 
+		END,
+	error_count = CASE 
+		WHEN 
+			s.status = 'E' 
+		THEN 
+			error_count + 1 
+		ELSE 
+			error_count 
+		END,
+	next_attempt = CASE 
+		WHEN 
+			s.status = 'E' 
+		THEN 
+			NOW() + (5 * (error_count+1) * interval '1 minutes') 
+		ELSE 
+			next_attempt 
+		END,
+	sent_on = CASE 
+		WHEN 
+			s.status = 'W' 
+		THEN 
+			NOW() 
+		ELSE 
+			sent_on 
+		END,
+	external_id = CASE
+		WHEN 
+			s.external_id != ''
+		THEN
+			s.external_id
+		ELSE
+			msgs_msg.external_id
+		END,
+	modified_on = NOW()
+FROM
+	(VALUES(:msg_id, :channel_id, :status, :external_id)) 
+AS 
+	s(msg_id, channel_id, status, external_id) 
+WHERE 
+	msgs_msg.id = s.msg_id::int AND
+	msgs_msg.channel_id = s.channel_id::int AND 
+	msgs_msg.direction = 'O'
+RETURNING 
+	msgs_msg.id
+`
+
 //-----------------------------------------------------------------------------
 // MsgStatusUpdate implementation
 //-----------------------------------------------------------------------------
@@ -232,6 +300,8 @@ type DBMsgStatus struct {
 	ChannelUUID_ courier.ChannelUUID    `json:"channel_uuid"             db:"channel_uuid"`
 	ChannelID_   courier.ChannelID      `json:"channel_id"               db:"channel_id"`
 	ID_          courier.MsgID          `json:"msg_id,omitempty"         db:"msg_id"`
+	OldURN_      urns.URN               `json:"old_urn"                  db:"old_urn"`
+	NewURN_      urns.URN               `json:"new_urn"                  db:"new_urn"`
 	ExternalID_  string                 `json:"external_id,omitempty"    db:"external_id"`
 	Status_      courier.MsgStatusValue `json:"status"                   db:"status"`
 	ModifiedOn_  time.Time              `json:"modified_on"              db:"modified_on"`
@@ -239,10 +309,46 @@ type DBMsgStatus struct {
 	logs []*courier.ChannelLog
 }
 
-func (s *DBMsgStatus) EventID() int64 { return s.ID_.Int64 }
+func (s *DBMsgStatus) EventID() int64 { return int64(s.ID_) }
 
 func (s *DBMsgStatus) ChannelUUID() courier.ChannelUUID { return s.ChannelUUID_ }
 func (s *DBMsgStatus) ID() courier.MsgID                { return s.ID_ }
+
+func (s *DBMsgStatus) RowID() string {
+	if s.ID_ != courier.NilMsgID {
+		return strconv.FormatInt(int64(s.ID_), 10)
+	} else if s.ExternalID_ != "" {
+		return s.ExternalID_
+	}
+	return ""
+}
+
+func (s *DBMsgStatus) SetUpdatedURN(old, new urns.URN) error {
+	// check by nil URN
+	if old == urns.NilURN || new == urns.NilURN {
+		return errors.New("cannot update contact URN from/to nil URN")
+	}
+	// only update to the same scheme
+	if old.Scheme() != new.Scheme() {
+		return errors.New("cannot update contact URN to a different scheme")
+	}
+	// don't update to the same URN path
+	if old.Path() == new.Path() {
+		return errors.New("cannot update contact URN to the same path")
+	}
+	s.OldURN_ = old
+	s.NewURN_ = new
+	return nil
+}
+func (s *DBMsgStatus) UpdatedURN() (urns.URN, urns.URN) {
+	return s.OldURN_, s.NewURN_
+}
+func (s *DBMsgStatus) HasUpdatedURN() bool {
+	if s.OldURN_ != urns.NilURN && s.NewURN_ != urns.NilURN {
+		return true
+	}
+	return false
+}
 
 func (s *DBMsgStatus) ExternalID() string      { return s.ExternalID_ }
 func (s *DBMsgStatus) SetExternalID(id string) { s.ExternalID_ = id }

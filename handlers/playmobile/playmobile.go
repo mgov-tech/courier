@@ -3,11 +3,11 @@ package playmobile
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"net/http"
-	"encoding/xml"
 	"strings"
-	"encoding/json"
 
 	"github.com/nyaruka/courier"
 	"github.com/nyaruka/courier/handlers"
@@ -21,8 +21,8 @@ const (
 )
 
 var (
-	maxMsgLength = 160
-	sendURL = "%s/broker-api/send"
+	maxMsgLength = 640
+	sendURL      = "%s/broker-api/send"
 )
 
 func init() {
@@ -67,7 +67,7 @@ type mtMessage struct {
 	SMS       struct {
 		Originator string `json:"originator"`
 		Content    struct {
-			Text   string `json:"text"`
+			Text string `json:"text"`
 		} `json:"content"`
 	} `json:"sms"`
 }
@@ -84,7 +84,7 @@ type mtResponse struct {
 		ID         string `xml:"id,attr"`
 		MSIDSN     string `xml:"msisdn,attr"`
 		SubmitDate string `xml:"submit-date,attr"`
-		Content struct {
+		Content    struct {
 			Text string `xml:",chardata"`
 		} `xml:"content"`
 	} `xml:"message"`
@@ -150,12 +150,16 @@ func (h *handler) SendMsg(_ context.Context, msg courier.Msg) (courier.MsgStatus
 
 	status := h.Backend().NewMsgStatusForID(msg.Channel(), msg.ID(), courier.MsgErrored)
 
-	for _, part := range handlers.SplitMsg(handlers.GetTextAndAttachments(msg), maxMsgLength) {
+	for i, part := range handlers.SplitMsgByChannel(msg.Channel(), handlers.GetTextAndAttachments(msg), maxMsgLength) {
 		payload := mtPayload{}
 		message := mtMessage{}
 
+		messageid := msg.ID().String()
+		if i > 0 {
+			messageid = fmt.Sprintf("%s.%d", msg.ID().String(), i+1)
+		}
+		message.MessageID = messageid
 		message.Recipient = strings.TrimLeft(msg.URN().Path(), "+")
-		message.MessageID = msg.ID().String()
 		message.SMS.Originator = shortCode
 		message.SMS.Content.Text = part
 

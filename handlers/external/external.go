@@ -20,6 +20,7 @@ import (
 	"github.com/nyaruka/courier/handlers"
 	"github.com/nyaruka/courier/utils"
 	"github.com/nyaruka/gocommon/urns"
+	"github.com/pkg/errors"
 )
 
 const (
@@ -30,6 +31,10 @@ const (
 	configFromXPath = "from_xpath"
 	configTextXPath = "text_xpath"
 
+	configMOFromField = "mo_from_field"
+	configMOTextField = "mo_text_field"
+	configMODateField = "mo_date_field"
+
 	configMOResponseContentType = "mo_response_content_type"
 	configMOResponse            = "mo_response"
 
@@ -38,6 +43,10 @@ const (
 	encodingDefault       = "D"
 	encodingSmart         = "S"
 )
+
+var defaultFromFields = []string{"from", "sender"}
+var defaultTextFields = []string{"text"}
+var defaultDateFields = []string{"date", "time"}
 
 var contentTypeMappings = map[string]string{
 	contentURLEncoded: "application/x-www-form-urlencoded",
@@ -113,23 +122,37 @@ func (h *handler) receiveStopContact(ctx context.Context, channel courier.Channe
 	return []courier.Event{channelEvent}, courier.WriteChannelEventSuccess(ctx, w, r, channelEvent)
 }
 
-type moForm struct {
-	From   string `name:"from"`
-	Sender string `name:"sender"`
-	Text   string `validate:"required" name:"text"`
-	Date   string `name:"date"`
-	Time   string `name:"time"`
+// utility function to grab the form value for either the passed in name (if non-empty) or the first set
+// value from defaultNames
+func getFormField(form url.Values, defaultNames []string, name string) string {
+	if name != "" {
+		values, found := form[name]
+		if found {
+			return values[0]
+		}
+	}
+
+	for _, name := range defaultNames {
+		values, found := form[name]
+		if found {
+			return values[0]
+		}
+	}
+
+	return ""
 }
 
 // receiveMessage is our HTTP handler function for incoming messages
 func (h *handler) receiveMessage(ctx context.Context, channel courier.Channel, w http.ResponseWriter, r *http.Request) ([]courier.Event, error) {
 	var err error
-	form := &moForm{}
+
+	var from, dateString, text string
 
 	fromXPath := channel.StringConfigForKey(configFromXPath, "")
 	textXPath := channel.StringConfigForKey(configTextXPath, "")
 
 	if fromXPath != "" && textXPath != "" {
+		// we are reading from an XML body, pull out our fields
 		body, err := ioutil.ReadAll(io.LimitReader(r.Body, 100000))
 		defer r.Body.Close()
 		if err != nil {
@@ -140,36 +163,32 @@ func (h *handler) receiveMessage(ctx context.Context, channel courier.Channel, w
 		if err != nil {
 			return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, fmt.Errorf("unable to parse request XML: %s", err))
 		}
-		senderNode := xmlquery.FindOne(doc, fromXPath)
+		fromNode := xmlquery.FindOne(doc, fromXPath)
 		textNode := xmlquery.FindOne(doc, textXPath)
-		if senderNode == nil || textNode == nil {
+		if fromNode == nil || textNode == nil {
 			return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, fmt.Errorf("missing from at: %s or text at: %s node", fromXPath, textXPath))
 		}
 
-		form.Sender = senderNode.InnerText()
-		form.Text = textNode.InnerText()
+		from = fromNode.InnerText()
+		text = textNode.InnerText()
 	} else {
-		err := handlers.DecodeAndValidateForm(form, r)
+		// parse our form
+		err := r.ParseForm()
 		if err != nil {
-			return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
+			return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, errors.Wrapf(err, "invalid request"))
 		}
 
+		from = getFormField(r.Form, defaultFromFields, channel.StringConfigForKey(configMOFromField, ""))
+		text = getFormField(r.Form, defaultTextFields, channel.StringConfigForKey(configMOTextField, ""))
+		dateString = getFormField(r.Form, defaultDateFields, channel.StringConfigForKey(configMODateField, ""))
 	}
-	// must have one of from or sender set, error if neither
-	sender := form.Sender
-	if sender == "" {
-		sender = form.From
-	}
-	if sender == "" {
+
+	// must have from field
+	if from == "" {
 		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, fmt.Errorf("must have one of 'sender' or 'from' set"))
 	}
 
 	// if we have a date, parse it
-	dateString := form.Date
-	if dateString == "" {
-		dateString = form.Time
-	}
-
 	date := time.Now()
 	if dateString != "" {
 		date, err = time.Parse(time.RFC3339Nano, dateString)
@@ -181,17 +200,17 @@ func (h *handler) receiveMessage(ctx context.Context, channel courier.Channel, w
 	// create our URN
 	urn := urns.NilURN
 	if channel.Schemes()[0] == urns.TelScheme {
-		urn, err = handlers.StrictTelForCountry(sender, channel.Country())
+		urn, err = handlers.StrictTelForCountry(from, channel.Country())
 	} else {
-		urn, err = urns.NewURNFromParts(channel.Schemes()[0], sender, "", "")
+		urn, err = urns.NewURNFromParts(channel.Schemes()[0], from, "", "")
 	}
 	if err != nil {
 		return nil, handlers.WriteAndLogRequestError(ctx, h, channel, w, r, err)
 	}
-	urn = urn.Normalize("")
+	urn = urn.Normalize(channel.Country())
 
 	// build our msg
-	msg := h.Backend().NewIncomingMsg(channel, urn, form.Text).WithReceivedOn(date)
+	msg := h.Backend().NewIncomingMsg(channel, urn, text).WithReceivedOn(date)
 
 	// and finally write our message
 	return handlers.WriteMsgsAndResponse(ctx, h, []courier.Msg{msg}, w, r)
@@ -266,10 +285,9 @@ func (h *handler) SendMsg(ctx context.Context, msg courier.Msg) (courier.MsgStat
 		contentTypeHeader = contentType
 	}
 
-	maxLength := msg.Channel().IntConfigForKey(courier.ConfigMaxLength, 160)
 	status := h.Backend().NewMsgStatusForID(msg.Channel(), msg.ID(), courier.MsgErrored)
-	parts := handlers.SplitMsg(handlers.GetTextAndAttachments(msg), maxLength)
-	for _, part := range parts {
+	parts := handlers.SplitMsgByChannel(msg.Channel(), handlers.GetTextAndAttachments(msg), 160)
+	for i, part := range parts {
 		// build our request
 		form := map[string]string{
 			"id":           msg.ID().String(),
@@ -281,6 +299,16 @@ func (h *handler) SendMsg(ctx context.Context, msg courier.Msg) (courier.MsgStat
 			"channel":      msg.Channel().UUID().String(),
 		}
 
+		useNationalStr := msg.Channel().ConfigForKey(courier.ConfigUseNational, false)
+		useNational, _ := useNationalStr.(bool)
+
+		// if we are meant to use national formatting (no country code) pull that out
+		if useNational {
+			nationalTo := msg.URN().Localize(msg.Channel().Country())
+			form["to"] = nationalTo.Path()
+			form["to_no_plus"] = nationalTo.Path()
+		}
+
 		// if we are smart, first try to convert to GSM7 chars
 		if encoding == encodingSmart {
 			replaced := gsm7.ReplaceSubstitutions(part)
@@ -289,10 +317,26 @@ func (h *handler) SendMsg(ctx context.Context, msg courier.Msg) (courier.MsgStat
 			}
 		}
 
-		url := replaceVariables(sendURL, form, contentURLEncoded)
+		formEncoded := encodeVariables(form, contentURLEncoded)
+
+		// put quick replies on last message part
+		if i == len(parts)-1 {
+			formEncoded["quick_replies"] = buildQuickRepliesResponse(msg.QuickReplies(), sendMethod, contentURLEncoded)
+		} else {
+			formEncoded["quick_replies"] = buildQuickRepliesResponse([]string{}, sendMethod, contentURLEncoded)
+		}
+		url := replaceVariables(sendURL, formEncoded)
+
 		var body io.Reader
 		if sendMethod == http.MethodPost || sendMethod == http.MethodPut {
-			body = strings.NewReader(replaceVariables(sendBody, form, contentType))
+			formEncoded = encodeVariables(form, contentType)
+
+			if i == len(parts)-1 {
+				formEncoded["quick_replies"] = buildQuickRepliesResponse(msg.QuickReplies(), sendMethod, contentType)
+			} else {
+				formEncoded["quick_replies"] = buildQuickRepliesResponse([]string{}, sendMethod, contentType)
+			}
+			body = strings.NewReader(replaceVariables(sendBody, formEncoded))
 		}
 
 		req, err := http.NewRequest(sendMethod, url, body)
@@ -325,7 +369,40 @@ func (h *handler) SendMsg(ctx context.Context, msg courier.Msg) (courier.MsgStat
 	return status, nil
 }
 
-func replaceVariables(text string, variables map[string]string, contentType string) string {
+type quickReplyXMLItem struct {
+	XMLName xml.Name `xml:"item"`
+	Value   string   `xml:",chardata"`
+}
+
+func buildQuickRepliesResponse(quickReplies []string, sendMethod string, contentType string) string {
+	if quickReplies == nil {
+		quickReplies = []string{}
+	}
+	if (sendMethod == http.MethodPost || sendMethod == http.MethodPut) && contentType == contentJSON {
+		marshalled, _ := json.Marshal(quickReplies)
+		return string(marshalled)
+	} else if (sendMethod == http.MethodPost || sendMethod == http.MethodPut) && contentType == contentXML {
+		items := make([]quickReplyXMLItem, len(quickReplies))
+
+		for i, v := range quickReplies {
+			items[i] = quickReplyXMLItem{Value: v}
+		}
+		marshalled, _ := xml.Marshal(items)
+		return string(marshalled)
+	} else {
+		response := bytes.Buffer{}
+
+		for _, reply := range quickReplies {
+			reply = url.QueryEscape(reply)
+			response.WriteString(fmt.Sprintf("&quick_reply=%s", reply))
+		}
+		return response.String()
+	}
+}
+
+func encodeVariables(variables map[string]string, contentType string) map[string]string {
+	encoded := make(map[string]string)
+
 	for k, v := range variables {
 		// encode according to our content type
 		switch contentType {
@@ -341,7 +418,13 @@ func replaceVariables(text string, variables map[string]string, contentType stri
 			xml.EscapeText(buf, []byte(v))
 			v = buf.String()
 		}
+		encoded[k] = v
+	}
+	return encoded
+}
 
+func replaceVariables(text string, variables map[string]string) string {
+	for k, v := range variables {
 		text = strings.Replace(text, fmt.Sprintf("{{%s}}", k), v, -1)
 	}
 	return text

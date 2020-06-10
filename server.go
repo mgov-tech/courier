@@ -3,11 +3,13 @@ package courier
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"os"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"time"
@@ -131,6 +133,24 @@ func (s *server) Start() error {
 		}
 	}()
 
+	// start our heartbeat
+	go func() {
+		s.waitGroup.Add(1)
+		defer s.waitGroup.Done()
+
+		for !s.stopped {
+			select {
+			case <-s.stopChan:
+				return
+			case <-time.After(time.Minute):
+				err := s.backend.Heartbeat()
+				if err != nil {
+					logrus.WithError(err).Error("error running backend heartbeat")
+				}
+			}
+		}
+	}()
+
 	logrus.WithFields(logrus.Fields{
 		"comp":    "server",
 		"port":    s.config.Port,
@@ -248,7 +268,7 @@ func (s *server) channelHandleWrapper(handler ChannelHandler, handlerFunc Channe
 		baseCtx := context.WithValue(r.Context(), contextRequestURL, r.URL.String())
 		baseCtx = context.WithValue(baseCtx, contextRequestStart, time.Now())
 
-		// add a 25 second timeout
+		// add a 30 second timeout
 		ctx, cancel := context.WithTimeout(baseCtx, time.Second*30)
 		defer cancel()
 
@@ -268,6 +288,9 @@ func (s *server) channelHandleWrapper(handler ChannelHandler, handlerFunc Channe
 
 		// read the bytes from our body so we can create a channel log for this request
 		response := &bytes.Buffer{}
+
+		// Trim out cookie header, should never be part of authentication and can leak auth to channel logs
+		r.Header.Del("Cookie")
 		request, err := httputil.DumpRequest(r, true)
 		if err != nil {
 			writeAndLogRequestError(ctx, w, r, channel, err)
@@ -279,6 +302,16 @@ func (s *server) channelHandleWrapper(handler ChannelHandler, handlerFunc Channe
 		ww.Tee(response)
 
 		logs := make([]*ChannelLog, 0, 1)
+
+		defer func() {
+			// catch any panics and recover
+			panicLog := recover()
+			if panicLog != nil {
+				debug.PrintStack()
+				logrus.WithError(err).WithField("channel_uuid", channel.UUID()).WithField("url", url).WithField("request", string(request)).WithField("trace", panicLog).Error("panic handling request")
+				writeAndLogRequestError(ctx, ww, r, channel, errors.New("panic handling msg"))
+			}
+		}()
 
 		events, err := handlerFunc(ctx, channel, ww, r)
 		duration := time.Now().Sub(start)
